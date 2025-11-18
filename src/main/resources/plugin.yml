@@ -1,6 +1,8 @@
-name: RealisticFire
+name: VoicePlugin
 version: 1.0
-main: com.nonkungch.realisticfire.RealisticFire
+main: com.nonkungch.voiceplugin.VoicePlugin
 api-version: 1.21
-author: NonKungCh
-description: Makes fire sources extinguish in the rain.
+commands:
+  linkvoice:
+    description: ลิงก์ Voice Chat ด้วยโค้ดจากเว็บ
+    usage: /linkvoice <code>
