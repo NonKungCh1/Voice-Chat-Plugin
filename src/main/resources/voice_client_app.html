@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>🎙️ Minecraft Voice Client</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background-color: #f4f4f9; }
+        .status { margin: 15px 0; padding: 10px; border-radius: 5px; font-weight: bold; }
+        .connecting { background-color: #ffeb3b; color: #333; }
+        .connected { background-color: #4CAF50; color: white; }
+        .disconnected { background-color: #F44336; color: white; }
+        input { padding: 8px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 4px; }
+        #ptt-button { background-color: #2196F3; color: white; padding: 15px 30px; }
+        #ptt-button:active { background-color: #0d47a1; }
+    </style>
+</head>
+<body>
+    <h1>🎙️ Minecraft Voice Client</h1>
+    <p>เปิดไมค์เพื่อพูดคุยในเกม (ใช้ได้ทั้ง PC/PE Browser)</p>
+
+    <div id="setup-form">
+        <input type="text" id="username" placeholder="Minecraft Username" required><br>
+        <input type="text" id="token" placeholder="Voice Token (จากคำสั่ง /linkvoice)" required><br>
+        <button id="connect-button">เชื่อมต่อไมโครโฟน</button>
+    </div>
+
+    <div class="status disconnected" id="connection-status">สถานะ: ตัดการเชื่อมต่อ</div>
+    
+    <div id="mic-status" style="display: none; margin-top: 20px;">
+        <p>🔊 ไมค์พร้อมใช้งานแล้ว!</p>
+        <button id="ptt-button" disabled>กดค้างไว้เพื่อพูด (PTT)</button>
+    </div>
+
+    <script>
+        // 💡 ตั้งค่า: ต้องตรงกับ Node.js Server
+        const VOICE_SERVER_WS_URL = "ws://localhost:8080"; 
+        const SAMPLE_RATE = 44100;
+        const JITTER_BUFFER_DELAY_MS = 200; 
+        
+        const usernameInput = document.getElementById('username');
+        const tokenInput = document.getElementById('token');
+        const connectButton = document.getElementById('connect-button');
+        const statusDiv = document.getElementById('connection-status');
+        const micStatusDiv = document.getElementById('mic-status');
+        const pttButton = document.getElementById('ptt-button');
+        
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let isSpeaking = false;
+        const playerAudioQueues = {};
+
+        // ------------------ CLASS JITTER BUFFER ------------------
+        class AudioQueue {
+            // (ใส่โค้ด Class AudioQueue ที่สมบูรณ์จากขั้นตอนที่ 12 ที่นี่)
+            constructor(audioContext, sender) {
+                this.context = audioContext;
+                this.sender = sender;
+                this.queue = []; 
+                this.isPlaying = false;
+                this.nextTime = 0; 
+                this.bufferInterval = null;
+                this.startCheckInterval();
+            }
+
+            enqueue(audioBuffer) { this.queue.push(audioBuffer); }
+
+            startCheckInterval() {
+                this.bufferInterval = setInterval(() => { this.processQueue(); }, 50);
+            }
+
+            processQueue() {
+                if (this.queue.length === 0) return;
+                
+                // ตรวจสอบขั้นต่ำของ Jitter Buffer
+                if (!this.isPlaying && this.queue.length * this.queue[0].duration < (JITTER_BUFFER_DELAY_MS / 1000)) {
+                    return; 
+                }
+                
+                this.isPlaying = true;
+                this.playNextPacket();
+            }
+
+            playNextPacket() {
+                if (this.queue.length === 0) {
+                    this.isPlaying = false;
+                    this.nextTime = 0; 
+                    return;
+                }
+                
+                const buffer = this.queue.shift();
+                const source = this.context.createBufferSource();
+                source.buffer = buffer;
+                source.connect(this.context.destination);
+                
+                if (this.nextTime === 0) {
+                    this.nextTime = this.context.currentTime + (JITTER_BUFFER_DELAY_MS / 1000);
+                }
+                
+                source.start(this.nextTime);
+                this.nextTime += buffer.duration;
+                
+                source.onended = () => { this.playNextPacket(); };
+            }
+            
+            destroy() {
+                clearInterval(this.bufferInterval);
+                this.queue = [];
+            }
+        }
+        // ------------------ END CLASS JITTER BUFFER ------------------
+
+        // --- ฟังก์ชันช่วยเหลือ ---
+        function updateStatus(status, message) {
+            statusDiv.className = `status ${status}`;
+            statusDiv.textContent = `สถานะ: ${message}`;
+        }
+        
+        // --- การเชื่อมต่อ WebSocket ---
+        function connectWebSocket(username, token) {
+            updateStatus('connecting', 'กำลังเชื่อมต่อ...');
+            ws = new WebSocket(VOICE_SERVER_WS_URL);
+            
+            ws.onopen = () => {
+                const authMessage = JSON.stringify({ type: "auth", username: username, token: token });
+                ws.send(authMessage);
+                updateStatus('connected', 'เชื่อมต่อ Voice Server สำเร็จ!');
+                micStatusDiv.style.display = 'block';
+                startMicrophone(); 
+            };
+            
+            let audioHeader = null; 
+            ws.onmessage = async (event) => {
+                if (typeof event.data === 'string') {
+                    // รับ Header
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'audio') {
+                            audioHeader = data;
+                        }
+                    } catch (e) {}
+                } else if (event.data instanceof ArrayBuffer && audioHeader) {
+                    // รับ Binary และเล่นเสียง
+                    await playReceivedAudio(audioHeader.sender, event.data);
+                    audioHeader = null;
+                }
+            };
+
+            ws.onclose = () => {
+                updateStatus('disconnected', 'ตัดการเชื่อมต่อ Voice Server');
+                pttButton.disabled = true;
+                if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+            };
+            ws.onerror = (error) => { console.error("WebSocket Error:", error); updateStatus('disconnected', 'เกิดข้อผิดพลาด'); };
+        }
+        
+        // --- การเข้าถึงไมโครโฟนและการสตรีม ---
+        async function startMicrophone() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN && isSpeaking) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const int16Array = new Int16Array(inputData.length);
+                        
+                        // แปลง Float32 เป็น Int16 PCM 
+                        for (let i = 0; i < inputData.length; i++) {
+                            int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32767));
+                        }
+                        
+                        // ส่งข้อมูลเสียงดิบ
+                        ws.send(int16Array.buffer); 
+                    }
+                };
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                pttButton.disabled = false;
+
+            } catch (err) {
+                console.error("❌ ไม่สามารถเข้าถึงไมโครโฟนได้:", err);
+                alert("ไม่สามารถเข้าถึงไมโครโฟนได้");
+            }
+        }
+        
+        // --- การเล่นเสียงที่ได้รับ (ใช้ Jitter Buffer) ---
+        async function playReceivedAudio(sender, audioDataBuffer) {
+            if (!audioContext) return;
+
+            const int16Array = new Int16Array(audioDataBuffer);
+            const float32Array = new Float32Array(int16Array.length);
+
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32767.0;
+            }
+
+            const audioBuffer = audioContext.createBuffer(1, float32Array.length, SAMPLE_RATE);
+            audioBuffer.getChannelData(0).set(float32Array);
+            
+            if (!playerAudioQueues[sender]) {
+                playerAudioQueues[sender] = new AudioQueue(audioContext, sender);
+            }
+
+            playerAudioQueues[sender].enqueue(audioBuffer);
+        }
+        
+        // --- Event Listeners ---
+        connectButton.addEventListener('click', () => {
+            const username = usernameInput.value.trim();
+            const token = tokenInput.value.trim();
+            if (username && token) connectWebSocket(username, token);
+        });
+
+        pttButton.addEventListener('mousedown', () => {
+            isSpeaking = true;
+            pttButton.style.backgroundColor = 'green';
+            pttButton.textContent = 'กำลังพูด...';
+        });
+
+        pttButton.addEventListener('mouseup', () => {
+            isSpeaking = false;
+            pttButton.style.backgroundColor = '#2196F3';
+            pttButton.textContent = 'กดค้างไว้เพื่อพูด (PTT)';
+        });
+        
+    </script>
+</body>
+  </html>
