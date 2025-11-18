@@ -1,0 +1,21 @@
+{
+  "name": "voice-server-backend",
+  "version": "1.0.0",
+  "description": "Node.js backend for Minecraft Voice Chat streaming and code verification.",
+  "main": "voice_stream_server.js",
+  "scripts": {
+    "start": "node voice_stream_server.js"
+  },
+  "keywords": [
+    "minecraft",
+    "voicechat",
+    "websocket",
+    "express"
+  ],
+  "author": "Your Name or Project Name",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0"
+  }
+}
